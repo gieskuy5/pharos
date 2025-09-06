@@ -1,162 +1,251 @@
+# faucet.py — Pharos Testnet Faucet (tampilan sederhana & rapi)
+
 import requests
 import json
-from eth_account.messages import encode_defunct
-from web3 import Web3  # (dipakai untuk tipe/kompat, biarkan)
 import time
+from typing import List, Dict, Optional, Tuple
 from eth_account import Account
-import random
+from eth_account.messages import encode_defunct
 
-# ====== Konfigurasi API ======
+# ──( Konfigurasi API )───────────────────────────────────────────────────────────
 BASE_URL = "https://api.pharosnetwork.xyz"
-HEADERS = {
-    'accept': 'application/json, text/plain, */*',
-    'accept-language': 'en-GB,en-US;q=0.9,en;q=0.8',
-    'authorization': 'Bearer null',
-    'content-length': '0',
-    'origin': 'https://testnet.pharosnetwork.xyz',
-    'priority': 'u=1, i',
-    'referer': 'https://testnet.pharosnetwork.xyz/',
-    'sec-ch-ua': '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"Windows"',
-    'sec-fetch-dest': 'empty',
-    'sec-fetch-mode': 'cors',
-    'sec-fetch-site': 'same-site',
-    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36'
+HEADERS_BASE = {
+    "accept": "application/json, text/plain, */*",
+    "accept-language": "en-GB,en-US;q=0.9,en;q=0.8",
+    "authorization": "Bearer null",
+    "content-length": "0",
+    "origin": "https://testnet.pharosnetwork.xyz",
+    "priority": "u=1, i",
+    "referer": "https://testnet.pharosnetwork.xyz/",
+    "sec-ch-ua": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-site",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
 }
 
-# ====== HTTP helper ======
-def make_request(method, url, params=None, headers=None, retries=5, backoff_factor=1.5):
+# ──( Util tampilan )─────────────────────────────────────────────────────────────
+def fmt_addr(addr: str) -> str:
+    return addr if len(addr) <= 14 else f"{addr[:8]}…{addr[-4:]}"
+
+def ok_json(data: dict) -> bool:
+    # Umumnya API sukses: {"code":0, "data": {...}}
+    return isinstance(data, dict) and data.get("code") == 0
+
+def get_streak_from_status(data: dict) -> Optional[int]:
+    """
+    Coba ambil informasi 'streak' / hari berturut-turut dari response /sign/status
+    Struktur pasti API bisa berubah; aman-kan akses.
+    """
+    try:
+        d = data.get("data") or {}
+        # Beberapa API pakai 'consecutiveDays' atau 'streak'
+        for k in ("consecutiveDays", "streak", "continueDays", "days"):
+            if k in d and isinstance(d[k], int):
+                return d[k]
+    except Exception:
+        pass
+    return None
+
+def safe_get_msg(data: dict) -> str:
+    # Ambil pesan yang human-friendly kalau ada
+    if not isinstance(data, dict):
+        return "-"
+    if "msg" in data and isinstance(data["msg"], str):
+        return data["msg"]
+    if "message" in data and isinstance(data["message"], str):
+        return data["message"]
+    return "-"
+
+# ──( HTTP helper )───────────────────────────────────────────────────────────────
+def make_request(method: str, url: str, params=None, headers=None, retries=3, backoff=1.5):
     for attempt in range(retries):
         try:
-            response = requests.request(method, url, params=params, headers=headers, timeout=15)
-            if response.status_code in [200, 201]:
-                return response
-            print(f"⚠️ Request failed with status {response.status_code}, attempt {attempt + 1}/{retries}")
-        except Exception as e:
-            print(f"⚠️ Request error: {str(e)}, attempt {attempt + 1}/{retries}")
-        if attempt < retries - 1:
-            wait_time = backoff_factor ** attempt
-            print(f"⏳ Waiting {wait_time:.1f} seconds before retry...")
-            time.sleep(wait_time)
-    return None
-
-# ====== File utils ======
-def read_private_keys(filename="privatekey.txt"):
-    try:
-        with open(filename, 'r') as file:
-            return [line.strip() for line in file if line.strip()]
-    except FileNotFoundError:
-        print(f"❌ Error: {filename} not found")
-        return []
-
-def read_invite_code(filename="reff.txt"):
-    try:
-        with open(filename, 'r') as file:
-            return file.read().strip()
-    except FileNotFoundError:
-        print(f"❌ Error: {filename} not found")
-        return "fgi8ZeVTz5WQEm2X"  # fallback
-
-# ====== Auth & aksi ======
-def generate_signature(private_key, message="pharos"):
-    try:
-        acct = Account.from_key(private_key)
-        message_encoded = encode_defunct(text=message)
-        signed = acct.sign_message(message_encoded)
-        signature = signed.signature.hex()
-        if not signature.startswith("0x"):
-            signature = "0x" + signature
-        return acct.address, signature
-    except Exception as e:
-        print(f"❌ Error generating signature: {str(e)}")
-        return None, None
-
-def login(address, signature):
-    url = f"{BASE_URL}/user/login"
-    params = {"address": address, "signature": signature}
-    response = make_request('POST', url, params=params, headers=HEADERS)
-    if response:
-        try:
-            data = response.json()
-            if data.get("code") == 0:
-                return data["data"]["jwt"]
+            r = requests.request(method, url, params=params, headers=headers, timeout=15)
+            if r.status_code in (200, 201):
+                return r
         except Exception:
             pass
+        if attempt < retries - 1:
+            time.sleep(backoff ** attempt)
     return None
 
-def sign_in(address, jwt_token):
-    url = f"{BASE_URL}/sign/in"
-    params = {"address": address}
-    headers = {**HEADERS, "authorization": f"Bearer {jwt_token}"}
-    response = make_request('POST', url, params=params, headers=headers)
-    return response.json() if response else None
-
-def check_sign_status(address, jwt_token):
-    url = f"{BASE_URL}/sign/status"
-    params = {"address": address}
-    headers = {**HEADERS, "authorization": f"Bearer {jwt_token}"}
-    response = make_request('GET', url, params=params, headers=headers)
-    return response.json() if response else None
-
-def claim_daily_faucet(address, jwt_token):
-    url = f"{BASE_URL}/faucet/daily"
-    params = {"address": address}
-    headers = {**HEADERS, "authorization": f"Bearer {jwt_token}"}
-    response = make_request('POST', url, params=params, headers=headers)
-    return response.json() if response else None
-
-# ====== Pipeline per akun ======
-def process_account(private_key, current_number, total_accounts):
+# ──( File utils )────────────────────────────────────────────────────────────────
+def read_private_keys(filename: str = "privatekey.txt") -> List[str]:
     try:
-        print(f"\n🔄 Memproses PK {current_number}/{total_accounts}")
-        address, signature = generate_signature(private_key)
-        if not address or not signature:
-            print("❌ Failed to generate signature")
-            return
+        with open(filename, "r", encoding="utf-8") as f:
+            return [ln.strip() for ln in f if ln.strip()]
+    except FileNotFoundError:
+        print("❌ File privatekey.txt tidak ditemukan")
+        return []
 
-        print(f"📝 Address: {address}")
-        jwt_token = login(address, signature)
-        if not jwt_token:
-            print("❌ Failed to login")
-            return
+def read_invite_code(filename: str = "reff.txt") -> Optional[str]:
+    try:
+        with open(filename, "r", encoding="utf-8") as f:
+            code = f.read().strip()
+            return code or None
+    except FileNotFoundError:
+        return None
 
-        sign_in_result = sign_in(address, jwt_token)
-        print(f"📤 Sign in result: {sign_in_result}")
+# ──( Auth )──────────────────────────────────────────────────────────────────────
+def generate_signature(private_key: str, message: str = "pharos") -> Tuple[Optional[str], Optional[str]]:
+    try:
+        acct = Account.from_key(private_key)
+        msg = encode_defunct(text=message)
+        sig = acct.sign_message(msg).signature.hex()
+        if not sig.startswith("0x"):
+            sig = "0x" + sig
+        return acct.address, sig
+    except Exception:
+        return None, None
 
-        status_result = check_sign_status(address, jwt_token)
-        print(f"📊 Sign status: {status_result}")
+def login(address: str, signature: str) -> Optional[str]:
+    url = f"{BASE_URL}/user/login"
+    resp = make_request("POST", url, params={"address": address, "signature": signature}, headers=HEADERS_BASE)
+    if not resp:
+        return None
+    try:
+        data = resp.json()
+        if ok_json(data):
+            return (data.get("data") or {}).get("jwt")
+    except Exception:
+        pass
+    return None
 
-        faucet_result = claim_daily_faucet(address, jwt_token)
-        print(f"💰 Faucet claim result: {faucet_result}")
+def api_with_jwt(path: str, method: str, jwt: str, address: str):
+    url = f"{BASE_URL}{path}"
+    headers = {**HEADERS_BASE, "authorization": f"Bearer {jwt}"}
+    resp = make_request(method, url, params={"address": address}, headers=headers)
+    try:
+        return resp.json() if resp else None
+    except Exception:
+        return None
 
-        time.sleep(1)
-    except Exception as e:
-        print(f"❌ Error processing account: {str(e)}")
+# ──( Pipeline per akun )─────────────────────────────────────────────────────────
+def process_account(pk: str, idx: int, total: int) -> Dict[str, Optional[str]]:
+    """
+    Kembalikan ringkasan: {
+      'addr': '0x..',
+      'login': '✓/✗',
+      'signin': '✓/✗',
+      'streak': 'n / -',
+      'faucet': '✓/✗',
+      'note': 'pesan singkat'
+    }
+    """
+    summary = {"addr": "-", "login": "✗", "signin": "✗", "streak": "-", "faucet": "✗", "note": "-"}
+    try:
+        acct = Account.from_key(pk)
+        addr = acct.address
+        summary["addr"] = fmt_addr(addr)
+    except Exception:
+        summary["note"] = "PK invalid"
+        return summary
 
-# ====== Runner ======
+    # Login
+    address, sig = generate_signature(pk)
+    if not (address and sig):
+        summary["note"] = "Sign message gagal"
+        return summary
+    jwt = login(address, sig)
+    if not jwt:
+        summary["note"] = "Login gagal"
+        return summary
+    summary["login"] = "✓"
+
+    # Sign-in harian
+    res_signin = api_with_jwt("/sign/in", "POST", jwt, address)
+    if ok_json(res_signin):
+        summary["signin"] = "✓"
+    else:
+        summary["signin"] = "✗"
+
+    # Status (ambil streak jika ada)
+    res_status = api_with_jwt("/sign/status", "GET", jwt, address)
+    st = get_streak_from_status(res_status or {})
+    if st is not None:
+        summary["streak"] = str(st)
+
+    # Faucet daily
+    res_faucet = api_with_jwt("/faucet/daily", "POST", jwt, address)
+    if ok_json(res_faucet):
+        summary["faucet"] = "✓"
+        summary["note"] = "OK"
+    else:
+        # tampilkan pesan singkat biar tahu kenapa gagal (mis. cooldown)
+        summary["note"] = safe_get_msg(res_faucet or {})
+    return summary
+
+# ──( Runner )────────────────────────────────────────────────────────────────────
+def print_header():
+    title = "PHAROS FAUCET — SIMPLE RUN"
+    print("\n" + title)
+    print("-" * len(title))
+
+def print_table(rows: List[Dict[str, str]]):
+    # Kolom: # | Address | Login | Sign-in | Streak | Faucet | Note
+    headers = ["#", "Address", "Login", "Sign-in", "Streak", "Faucet", "Note"]
+    widths = [4, 16, 7, 9, 8, 8, 30]
+
+    def fmt_row(cols, widths):
+        return " ".join(str(c).ljust(w) for c, w in zip(cols, widths))
+
+    print(fmt_row(headers, widths))
+    print(fmt_row(["─"*w for w in widths], widths))
+
+    for i, r in enumerate(rows, 1):
+        print(fmt_row([
+            i,
+            r.get("addr", "-"),
+            r.get("login", "-"),
+            r.get("signin", "-"),
+            r.get("streak", "-"),
+            r.get("faucet", "-"),
+            (r.get("note", "-") or "-")[:widths[-1]],
+        ], widths))
+
+def print_summary(rows: List[Dict[str, str]]):
+    total = len(rows)
+    log_ok = sum(1 for r in rows if r.get("login") == "✓")
+    si_ok = sum(1 for r in rows if r.get("signin") == "✓")
+    fc_ok = sum(1 for r in rows if r.get("faucet") == "✓")
+    print("\nSummary:")
+    print(f"  Accounts   : {total}")
+    print(f"  Login OK   : {log_ok}")
+    print(f"  Sign-in OK : {si_ok}")
+    print(f"  Faucet OK  : {fc_ok}\n")
+
 def run_once():
     private_keys = read_private_keys()
     if not private_keys:
-        print("❌ No private keys found")
         return
-    total = len(private_keys)
-    print(f"📊 Total PK yang akan diproses: {total}")
+
+    print_header()
+    rows = []
     for idx, pk in enumerate(private_keys, 1):
-        process_account(pk, idx, total)
+        row = process_account(pk, idx, len(private_keys))
+        rows.append(row)
+        # jeda pendek untuk jaga-jaga rate limit
+        time.sleep(0.3)
+
+    print_table(rows)
+    print_summary(rows)
 
 def run_loop(interval_sec: int = 3600):
     while True:
         run_once()
-        print(f"\n⏳ Semua akun selesai. Menunggu {interval_sec//3600} jam sebelum ulangi...")
+        hrs = max(1, interval_sec // 3600)
+        print(f"Menunggu {hrs} jam untuk siklus berikutnya…\n")
         time.sleep(interval_sec)
 
-def main(loop: bool = True, interval_sec: int = 3600):
+def main(loop: bool = False, interval_sec: int = 3600):
     if loop:
         run_loop(interval_sec)
     else:
         run_once()
 
 if __name__ == "__main__":
-    # Default: loop per jam seperti skrip asli
-    main(loop=True, interval_sec=3600)
+    # Default: sekali jalan agar output ringkas
+    main(loop=False, interval_sec=3600)
